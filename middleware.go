@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -105,7 +106,8 @@ type Prometheus struct {
 	// gin.Context string to use as a prometheus URL label
 	URLLabelFromContext string
 
-	EnableExemplar bool
+	EnableExemplar         bool
+	OtelPrometheusExporter *otelprom.Exporter
 }
 
 // PrometheusPushGateway contains the configuration for pushing to a Prometheus pushgateway (optional)
@@ -213,6 +215,12 @@ func (p *Prometheus) SetMetricsPathWithAuth(e *gin.Engine, accounts gin.Accounts
 // SetEnableExemplar set enable exemplar feature
 func (p *Prometheus) SetEnableExemplar(enableExemplar bool) *Prometheus {
 	p.EnableExemplar = enableExemplar
+	return p
+}
+
+// SetOtelPromExporter set opentelemetry prometheus exporter integration
+func (p *Prometheus) SetOtelPromExporter(otelPromExporter *otelprom.Exporter) *Prometheus {
+	p.OtelPrometheusExporter = otelPromExporter
 	return p
 }
 
@@ -415,17 +423,8 @@ func (p *Prometheus) HandlerFunc() gin.HandlerFunc {
 				p.reqCnt.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, url).Inc()
 			}
 
-			if exemplarObserver, ok := p.reqSz.(prometheus.ExemplarObserver); ok && traceID.IsValid() {
-				exemplarObserver.ObserveWithExemplar(float64(reqSz), prometheus.Labels{"traceID": traceID.String()})
-			} else {
-				p.reqSz.Observe(float64(reqSz))
-			}
-
-			if exemplarObserver, ok := p.resSz.(prometheus.ExemplarObserver); ok && traceID.IsValid() {
-				exemplarObserver.ObserveWithExemplar(resSz, prometheus.Labels{"traceID": traceID.String()})
-			} else {
-				p.resSz.Observe(resSz)
-			}
+			p.reqSz.Observe(float64(reqSz))
+			p.resSz.Observe(resSz)
 		}
 	}
 	return func(c *gin.Context) {
@@ -460,6 +459,9 @@ func (p *Prometheus) HandlerFunc() gin.HandlerFunc {
 }
 
 func (p *Prometheus) prometheusHandler() gin.HandlerFunc {
+	if p.OtelPrometheusExporter != nil {
+		prometheus.DefaultRegisterer.Register(p.OtelPrometheusExporter.Collector)
+	}
 	if p.EnableExemplar {
 		h := promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{
 			EnableOpenMetrics: true,
