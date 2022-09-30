@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var defaultMetricPath = "/metrics"
@@ -103,6 +104,8 @@ type Prometheus struct {
 
 	// gin.Context string to use as a prometheus URL label
 	URLLabelFromContext string
+
+	EnableExemplar bool
 }
 
 // PrometheusPushGateway contains the configuration for pushing to a Prometheus pushgateway (optional)
@@ -151,57 +154,66 @@ func NewPrometheus(subsystem string, customMetricsList ...[]*Metric) *Prometheus
 
 // SetPushGateway sends metrics to a remote pushgateway exposed on pushGatewayURL
 // every pushInterval. Metrics are fetched from metricsURL
-func (p *Prometheus) SetPushGateway(pushGatewayURL, metricsURL string, pushInterval time.Duration) {
+func (p *Prometheus) SetPushGateway(pushGatewayURL, metricsURL string, pushInterval time.Duration) *Prometheus {
 	p.Ppg.PushGatewayURL = pushGatewayURL
 	p.Ppg.MetricsURL = metricsURL
 	p.Ppg.PushInterval = pushInterval
 	p.startPushTicker()
+	return p
 }
 
 // SetPushGatewayJob job name, defaults to "gin"
-func (p *Prometheus) SetPushGatewayJob(j string) {
+func (p *Prometheus) SetPushGatewayJob(j string) *Prometheus {
 	p.Ppg.Job = j
+	return p
 }
 
 // SetListenAddress for exposing metrics on address. If not set, it will be exposed at the
 // same address of the gin engine that is being used
-func (p *Prometheus) SetListenAddress(address string) {
+func (p *Prometheus) SetListenAddress(address string) *Prometheus {
 	p.listenAddress = address
 	if p.listenAddress != "" {
 		p.router = gin.Default()
 	}
+	return p
 }
 
 // SetListenAddressWithRouter for using a separate router to expose metrics. (this keeps things like GET /metrics out of
 // your content's access log).
-func (p *Prometheus) SetListenAddressWithRouter(listenAddress string, r *gin.Engine) {
+func (p *Prometheus) SetListenAddressWithRouter(listenAddress string, r *gin.Engine) *Prometheus {
 	p.listenAddress = listenAddress
 	if len(p.listenAddress) > 0 {
 		p.router = r
 	}
+	return p
 }
 
 // SetMetricsPath set metrics paths
-func (p *Prometheus) SetMetricsPath(e *gin.Engine) {
-
+func (p *Prometheus) SetMetricsPath(e *gin.Engine) *Prometheus {
 	if p.listenAddress != "" {
-		p.router.GET(p.MetricsPath, prometheusHandler())
+		p.router.GET(p.MetricsPath, p.prometheusHandler())
 		p.runServer()
 	} else {
-		e.GET(p.MetricsPath, prometheusHandler())
+		e.GET(p.MetricsPath, p.prometheusHandler())
 	}
+	return p
 }
 
 // SetMetricsPathWithAuth set metrics paths with authentication
-func (p *Prometheus) SetMetricsPathWithAuth(e *gin.Engine, accounts gin.Accounts) {
-
+func (p *Prometheus) SetMetricsPathWithAuth(e *gin.Engine, accounts gin.Accounts) *Prometheus {
 	if p.listenAddress != "" {
-		p.router.GET(p.MetricsPath, gin.BasicAuth(accounts), prometheusHandler())
+		p.router.GET(p.MetricsPath, gin.BasicAuth(accounts), p.prometheusHandler())
 		p.runServer()
 	} else {
-		e.GET(p.MetricsPath, gin.BasicAuth(accounts), prometheusHandler())
+		e.GET(p.MetricsPath, gin.BasicAuth(accounts), p.prometheusHandler())
 	}
+	return p
+}
 
+// SetEnableExemplar set enable exemplar feature
+func (p *Prometheus) SetEnableExemplar(enableExemplar bool) *Prometheus {
+	p.EnableExemplar = enableExemplar
+	return p
 }
 
 func (p *Prometheus) runServer() {
@@ -364,6 +376,58 @@ func (p *Prometheus) UseWithAuth(e *gin.Engine, accounts gin.Accounts) {
 
 // HandlerFunc defines handler function for middleware
 func (p *Prometheus) HandlerFunc() gin.HandlerFunc {
+	if p.EnableExemplar {
+		return func(c *gin.Context) {
+			if c.Request.URL.Path == p.MetricsPath {
+				c.Next()
+				return
+			}
+
+			start := time.Now()
+			reqSz := computeApproximateRequestSize(c.Request)
+
+			c.Next()
+
+			status := strconv.Itoa(c.Writer.Status())
+			elapsed := float64(time.Since(start)) / float64(time.Second)
+			resSz := float64(c.Writer.Size())
+
+			url := p.ReqCntURLLabelMappingFn(c)
+			// jlambert Oct 2018 - sidecar specific mod
+			if len(p.URLLabelFromContext) > 0 {
+				u, found := c.Get(p.URLLabelFromContext)
+				if !found {
+					u = "unknown"
+				}
+				url = u.(string)
+			}
+
+			traceID := trace.SpanContextFromContext(c.Request.Context()).TraceID()
+			if exemplarObserver, ok := p.reqDur.WithLabelValues(status, c.Request.Method, url).(prometheus.ExemplarObserver); ok && traceID.IsValid() {
+				exemplarObserver.ObserveWithExemplar(elapsed, prometheus.Labels{"traceID": traceID.String()})
+			} else {
+				p.reqDur.WithLabelValues(status, c.Request.Method, url).Observe(elapsed)
+			}
+
+			if exemplarAdder, ok := p.reqCnt.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, url).(prometheus.ExemplarAdder); ok && traceID.IsValid() {
+				exemplarAdder.AddWithExemplar(1, prometheus.Labels{"traceID": traceID.String()})
+			} else {
+				p.reqCnt.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, url).Inc()
+			}
+
+			if exemplarObserver, ok := p.reqSz.(prometheus.ExemplarObserver); ok && traceID.IsValid() {
+				exemplarObserver.ObserveWithExemplar(float64(reqSz), prometheus.Labels{"traceID": traceID.String()})
+			} else {
+				p.reqSz.Observe(float64(reqSz))
+			}
+
+			if exemplarObserver, ok := p.resSz.(prometheus.ExemplarObserver); ok && traceID.IsValid() {
+				exemplarObserver.ObserveWithExemplar(resSz, prometheus.Labels{"traceID": traceID.String()})
+			} else {
+				p.resSz.Observe(resSz)
+			}
+		}
+	}
 	return func(c *gin.Context) {
 		if c.Request.URL.Path == p.MetricsPath {
 			c.Next()
@@ -395,7 +459,16 @@ func (p *Prometheus) HandlerFunc() gin.HandlerFunc {
 	}
 }
 
-func prometheusHandler() gin.HandlerFunc {
+func (p *Prometheus) prometheusHandler() gin.HandlerFunc {
+	if p.EnableExemplar {
+		h := promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{
+			EnableOpenMetrics: true,
+		})
+		return func(c *gin.Context) {
+			h.ServeHTTP(c.Writer, c.Request)
+		}
+	}
+
 	h := promhttp.Handler()
 	return func(c *gin.Context) {
 		h.ServeHTTP(c.Writer, c.Request)
