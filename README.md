@@ -1,11 +1,12 @@
-# go-gin-prometheus
-[![](https://godoc.org/github.com/zsais/go-gin-prometheus?status.svg)](https://godoc.org/github.com/zsais/go-gin-prometheus) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+# gin-prometheus
+[![](https://godoc.org/github.com/wei840222/gin-prometheus?status.svg)](https://godoc.org/github.com/wei840222/gin-prometheus)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Gin Web Framework Prometheus metrics exporter
+Gin Web Framework Prometheus metrics exporter with exemplar
 
 ## Installation
 
-`$ go get github.com/zsais/go-gin-prometheus`
+`$ go get github.com/wei840222/gin-prometheus`
 
 ## Usage
 
@@ -13,25 +14,27 @@ Gin Web Framework Prometheus metrics exporter
 package main
 
 import (
+	"net/http"
+
 	"github.com/gin-gonic/gin"
-	"github.com/zsais/go-gin-prometheus"
+	ginprom "github.com/wei840222/gin-prometheus"
 )
 
 func main() {
 	r := gin.New()
 
-	p := ginprometheus.NewPrometheus("gin")
+	p := ginprom.NewPrometheus("gin")
 	p.Use(r)
 
 	r.GET("/", func(c *gin.Context) {
-		c.JSON(200, "Hello world!")
+		c.JSON(http.StatusOK, "Hello world!")
 	})
 
-	r.Run(":29090")
+	r.Run()
 }
 ```
 
-See the [example.go file](https://github.com/zsais/go-gin-prometheus/blob/master/example/example.go)
+See the [example.go file](https://github.com/wei840222/gin-prometheus/blob/master/example/example.go)
 
 ## Preserving a low cardinality for the request counter
 
@@ -51,14 +54,16 @@ you could supply this mapping function to the middleware:
 package main
 
 import (
+	"net/http"
+
 	"github.com/gin-gonic/gin"
-	"github.com/zsais/go-gin-prometheus"
+	ginprom "github.com/wei840222/gin-prometheus"
 )
 
 func main() {
 	r := gin.New()
 
-	p := ginprometheus.NewPrometheus("gin")
+	p := ginprom.NewPrometheus("gin")
 
 	p.ReqCntURLLabelMappingFn = func(c *gin.Context) string {
 		url := c.Request.URL.Path
@@ -74,10 +79,10 @@ func main() {
 	p.Use(r)
 
 	r.GET("/", func(c *gin.Context) {
-		c.JSON(200, "Hello world!")
+		c.JSON(http.StatusOK, "Hello world!")
 	})
 
-	r.Run(":29090")
+	r.Run()
 }
 ```
 
