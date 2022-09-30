@@ -89,3 +89,92 @@ func main() {
 which would map `/customer/alice` and `/customer/bob` to their
 template `/customer/:name`, and thus preserve a low cardinality for
 our metrics.
+
+## Using with OpenTelemetry Tracer and Meter
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	ginprom "github.com/wei840222/gin-prometheus"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
+	"go.opentelemetry.io/otel/trace"
+)
+
+var ginOtelLogFormatter = func(param gin.LogFormatterParams) string {
+	var statusColor, methodColor, resetColor string
+	if param.IsOutputColor() {
+		statusColor = param.StatusCodeColor()
+		methodColor = param.MethodColor()
+		resetColor = param.ResetColor()
+	}
+
+	if param.Latency > time.Minute {
+		param.Latency = param.Latency.Truncate(time.Second)
+	}
+
+	return fmt.Sprintf("[GIN] %v |%s %3d %s| %13v | %15s |%s %-7s %s %#v traceID=%s\n%s",
+		param.TimeStamp.Format("2006/01/02 - 15:04:05"),
+		statusColor, param.StatusCode, resetColor,
+		param.Latency,
+		param.ClientIP,
+		methodColor, param.Method, resetColor,
+		param.Path,
+		trace.SpanContextFromContext(param.Request.Context()).TraceID(),
+		param.ErrorMessage,
+	)
+}
+
+func main() {
+	mExp := otelprom.New()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(mExp))
+	defer provider.Shutdown(context.Background())
+
+	tExp, err := otlptrace.New(context.Background(), otlptracegrpc.NewClient())
+	if err != nil {
+		panic(err)
+	}
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithBatcher(tExp),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String("myservice"),
+			semconv.ServiceVersionKey.String("0.0.1"),
+		)),
+	)
+	defer tp.Shutdown(context.Background())
+
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+
+	p := ginprom.NewPrometheus("gin").SetEnableExemplar(true).SetOtelPromExporter(&mExp)
+	p.SetListenAddress(":2222").SetMetricsPath(nil)
+
+	e := gin.New()
+	e.Use(otelgin.Middleware("gin", otelgin.WithTracerProvider(tp)), p.HandlerFunc(), gin.LoggerWithFormatter(ginOtelLogFormatter), gin.Recovery())
+
+	e.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, "Hello world!")
+	})
+	e.GET("/panic", func(c *gin.Context) {
+		panic("oh no")
+	})
+
+	e.Run()
+}
+```
