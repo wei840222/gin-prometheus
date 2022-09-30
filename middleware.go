@@ -2,7 +2,9 @@ package ginprom
 
 import (
 	"bytes"
-	"io/ioutil"
+	"context"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -11,7 +13,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	log "github.com/sirupsen/logrus"
 )
 
 var defaultMetricPath = "/metrics"
@@ -107,8 +108,8 @@ type Prometheus struct {
 // PrometheusPushGateway contains the configuration for pushing to a Prometheus pushgateway (optional)
 type PrometheusPushGateway struct {
 
-	// Push interval in seconds
-	PushIntervalSeconds time.Duration
+	// Push interval
+	PushInterval time.Duration
 
 	// Push Gateway URL in format http://domain:port
 	// where JOBNAME can be any string of your choice
@@ -133,9 +134,7 @@ func NewPrometheus(subsystem string, customMetricsList ...[]*Metric) *Prometheus
 		metricsList = customMetricsList[0]
 	}
 
-	for _, metric := range standardMetrics {
-		metricsList = append(metricsList, metric)
-	}
+	metricsList = append(metricsList, standardMetrics...)
 
 	p := &Prometheus{
 		MetricsList: metricsList,
@@ -151,11 +150,11 @@ func NewPrometheus(subsystem string, customMetricsList ...[]*Metric) *Prometheus
 }
 
 // SetPushGateway sends metrics to a remote pushgateway exposed on pushGatewayURL
-// every pushIntervalSeconds. Metrics are fetched from metricsURL
-func (p *Prometheus) SetPushGateway(pushGatewayURL, metricsURL string, pushIntervalSeconds time.Duration) {
+// every pushInterval. Metrics are fetched from metricsURL
+func (p *Prometheus) SetPushGateway(pushGatewayURL, metricsURL string, pushInterval time.Duration) {
 	p.Ppg.PushGatewayURL = pushGatewayURL
 	p.Ppg.MetricsURL = metricsURL
-	p.Ppg.PushIntervalSeconds = pushIntervalSeconds
+	p.Ppg.PushInterval = pushInterval
 	p.startPushTicker()
 }
 
@@ -212,11 +211,14 @@ func (p *Prometheus) runServer() {
 }
 
 func (p *Prometheus) getMetrics() []byte {
-	response, _ := http.Get(p.Ppg.MetricsURL)
+	res, err := http.Get(p.Ppg.MetricsURL)
+	if err != nil {
+		log.Printf("Error get local metrics: %s", err)
+		return nil
+	}
 
-	defer response.Body.Close()
-	body, _ := ioutil.ReadAll(response.Body)
-
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
 	return body
 }
 
@@ -229,15 +231,21 @@ func (p *Prometheus) getPushGatewayURL() string {
 }
 
 func (p *Prometheus) sendMetricsToPushGateway(metrics []byte) {
-	req, err := http.NewRequest("POST", p.getPushGatewayURL(), bytes.NewBuffer(metrics))
-	client := &http.Client{}
-	if _, err = client.Do(req); err != nil {
-		log.WithError(err).Errorln("Error sending to push gateway")
+	if len(metrics) == 0 {
+		return
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, p.getPushGatewayURL(), bytes.NewBuffer(metrics))
+	if err != nil {
+		log.Printf("Error build push gateway request: %s", err)
+		return
+	}
+	if _, err = http.DefaultClient.Do(req); err != nil {
+		log.Printf("Error sending to push gateway: %s", err)
 	}
 }
 
 func (p *Prometheus) startPushTicker() {
-	ticker := time.NewTicker(time.Second * p.Ppg.PushIntervalSeconds)
+	ticker := time.NewTicker(time.Second * p.Ppg.PushInterval)
 	go func() {
 		for range ticker.C {
 			p.sendMetricsToPushGateway(p.getMetrics())
@@ -326,7 +334,7 @@ func (p *Prometheus) registerMetrics(subsystem string) {
 	for _, metricDef := range p.MetricsList {
 		metric := NewMetric(metricDef, subsystem)
 		if err := prometheus.Register(metric); err != nil {
-			log.WithError(err).Errorf("%s could not be registered in Prometheus", metricDef.Name)
+			log.Printf("%s could not be registered in Prometheus: %s", metricDef.Name, err)
 		}
 		switch metricDef {
 		case reqCnt:
