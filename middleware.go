@@ -175,7 +175,8 @@ func (p *Prometheus) SetPushGatewayJob(j string) *Prometheus {
 func (p *Prometheus) SetListenAddress(address string) *Prometheus {
 	p.listenAddress = address
 	if p.listenAddress != "" {
-		p.router = gin.Default()
+		p.router = gin.New()
+		p.router.Use(gin.Recovery())
 	}
 	return p
 }
