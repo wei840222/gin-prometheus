@@ -460,9 +460,6 @@ func (p *Prometheus) HandlerFunc() gin.HandlerFunc {
 }
 
 func (p *Prometheus) prometheusHandler() gin.HandlerFunc {
-	if p.OtelPrometheusExporter != nil {
-		prometheus.DefaultRegisterer.Register(p.OtelPrometheusExporter.Collector)
-	}
 	if p.EnableExemplar {
 		h := promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{
 			EnableOpenMetrics: true,
